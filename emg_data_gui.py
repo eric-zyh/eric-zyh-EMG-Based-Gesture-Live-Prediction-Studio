@@ -1,3 +1,17 @@
+"""Tkinter application layer for EMGesture.
+
+This module owns the user-facing workflows: serial connection, live plotting,
+gesture capture, model training/testing screens, calibration, debug export, and
+the user-data browser. Lower-level filesystem/data operations live in
+``emg_data_tools`` and signal-processing/model operations live in
+``emg_model_tools``.
+
+The GUI is intentionally stateful because Tkinter callbacks mutate the current
+capture, prediction, and plotting state over time. Keep hardware/protocol
+assumptions documented at the parser boundary instead of scattering them across
+the event handlers.
+"""
+
 import time
 import tkinter as tk
 from collections import deque
@@ -78,6 +92,7 @@ GUIDED_SINGLE_REST_SECONDS = 3.0
 
 
 def discover_serial_ports(include_pseudo=True):
+    """Return serial-port candidates, including pseudo terminals for testing."""
     ports = []
     seen = set()
 
@@ -104,10 +119,22 @@ def discover_serial_ports(include_pseudo=True):
 
 
 def adc_to_voltage(adc_value):
+    """Convert a 10-bit Arduino ADC reading to volts using the configured Vref."""
     return (float(adc_value) / ADC_MAX) * VREF
 
 
 def parse_line(line):
+    """Parse one Arduino serial line into channel samples.
+
+    Supported formats:
+      * ``adc0`` or ``adc0 adc1``: raw ADC values; timestamp is host wallclock
+        and voltage is computed using ``VREF`` / ``ADC_MAX``.
+      * ``t_ms,adc0,voltage0`` or ``t_ms,adc0,voltage0,adc1,voltage1``:
+        device-timed samples with voltage already computed by the sender.
+
+    Returns ``({channel: (time_s, adc, voltage)}, format_name)`` or ``None`` for
+    blank/malformed lines. Channel names are normalized to ``a0`` / ``a1``.
+    """
     stripped = line.strip()
     if not stripped:
         return None
@@ -147,6 +174,14 @@ def parse_line(line):
 # Main GUI
 # ===================================================================
 class EMGCollectorGUI:
+    """Stateful Tkinter controller for the full EMG workflow.
+
+    The class is organized around screens and periodic callbacks rather than a
+    pure MVC split: Tk variables, serial buffers, capture state, and predictor
+    state all live here because they are updated by Tk's event loop. Expensive or
+    reusable logic should stay in ``emg_data_tools`` or ``emg_model_tools``.
+    """
+
     def __init__(self, root):
         self.root = root
         self.root.title("EMG Data System")

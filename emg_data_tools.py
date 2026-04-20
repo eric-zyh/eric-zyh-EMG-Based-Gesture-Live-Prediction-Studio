@@ -1,3 +1,11 @@
+"""Filesystem and metadata helpers for EMGesture.
+
+This module defines the app's on-disk data contract: users, labels, channel
+folders, capture CSV files, calibration JSON files, and model discovery paths.
+The GUI and model code should go through these helpers instead of constructing
+database paths or CSV schemas directly.
+"""
+
 import csv as csv_mod
 import json
 import math
@@ -49,6 +57,7 @@ def sanitize_channel_name(raw_name):
 
 
 def normalize_channel_selection(selected_channels=None, channel=DEFAULT_CHANNEL):
+    """Normalize GUI/channel inputs to a non-empty list of supported channels."""
     if selected_channels:
         channels = []
         for ch in selected_channels:
@@ -360,6 +369,12 @@ def list_data_files(mode, selected_users=None, selected_labels=None, selected_ch
 
 
 def list_capture_groups(mode, selected_users=None, selected_labels=None, selected_channels=None):
+    """Return multi-channel capture records with matching filenames.
+
+    A capture group represents the same gesture repetition recorded on multiple
+    channels. Training uses these groups to concatenate synchronized per-channel
+    features while keeping one label and one group id for the capture.
+    """
     channels = normalize_channel_selection(selected_channels=selected_channels)
     if len(channels) < 2:
         return []
@@ -476,6 +491,11 @@ def next_shared_capture_index(user_name, mode, label, channels):
 
 
 def write_capture(rows, user_name, mode, label, channel, filename=None):
+    """Write one labeled capture CSV and return its path.
+
+    ``rows`` must match the schema consumed by training:
+    ``time_s, adc, voltage, label``.
+    """
     safe_user = sanitize_user_name(user_name)
     safe_label = sanitize_label_name(label)
     safe_channel = sanitize_channel_name(channel)
