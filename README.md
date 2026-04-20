@@ -48,9 +48,7 @@ t_ms,adc0,voltage0,adc1,voltage1
 - If the Arduino sends timed comma-separated samples, the voltage fields are
   used directly.
 
-There is currently no Arduino `.ino` sketch committed in this repository. If a
-sketch is added later, place it under an `arduino/` directory and keep its serial
-output aligned with the formats above.
+Currently only supports one/two input channels. 
 
 ---
 
