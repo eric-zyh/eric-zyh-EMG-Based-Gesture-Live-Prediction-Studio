@@ -1,3 +1,15 @@
+"""Signal processing, feature extraction, training, and live inference.
+
+This module is the shared contract between offline model training and live
+prediction. Both paths should use the same baseline-centering, event detection,
+and feature-extraction logic so that training-time feature vectors match the
+feature vectors produced by ``LivePredictor`` at runtime.
+
+Saved model bundles are plain dictionaries persisted with ``joblib``. Each
+bundle contains the fitted classifier, fitted ``StandardScaler``, feature names,
+selected channels, training report, and live-prediction config.
+"""
+
 import time
 from collections import Counter, deque
 from pathlib import Path
@@ -505,6 +517,13 @@ def prepare_feature_signals(signals, channel_calibrations=None, k=3.0,
 def prepare_model_signals(signals, channel_calibrations=None, fs=200.0, label=None,
                           k=3.0, fallback_threshold=DEFAULT_FALLBACK_EVENT_THRESHOLD,
                           keep_full_window=None):
+    """Prepare raw capture signals for feature extraction.
+
+    Gesture labels are trimmed to the detected active event slice. ``rest``
+    captures keep the full window unless explicitly overridden because rest
+    should not contain an active event. Returns ``(prepared_signals, has_event)``
+    or ``(None, False)`` when a non-rest capture has no usable event.
+    """
     min_samples, pad_samples = _event_sample_counts(fs)
     if keep_full_window is None:
         keep_full_window = label == "rest"
@@ -528,6 +547,7 @@ def prepare_model_signals(signals, channel_calibrations=None, fs=200.0, label=No
 def analyze_model_window(signals, channel_calibrations=None, fs=200.0, k=3.0,
                          fallback_threshold=DEFAULT_FALLBACK_EVENT_THRESHOLD,
                          slice_strategy="largest"):
+    """Analyze a live/training window and return centered signals plus event slice."""
     min_samples, pad_samples = _event_sample_counts(fs)
     return _analyze_feature_window(
         signals,
@@ -613,6 +633,11 @@ def _token_statistics(signal, n_tokens=TOKEN_COUNT):
 
 
 def extract_feature_vector(signal, noise_std=None, feature_names=None):
+    """Convert one prepared EMG signal into a fixed-length feature vector.
+
+    The input may be a variable-length event slice. The output order follows
+    ``feature_names`` and is stable across training and live prediction.
+    """
     signal = np.asarray(signal, dtype=np.float32)
     feature_names = tuple(feature_names or FEATURE_NAMES)
 
@@ -1312,6 +1337,13 @@ def _single_training_bundle(training_source, dataset_source, selected_channels, 
 
 
 def train_named_model(mode, model_name, selected_users=None, selected_labels=None, channel=DEFAULT_CHANNEL, selected_channels=None, model_type="random_forest", calibration=None):
+    """Train and save a named single-gesture model bundle.
+
+    The GUI calls this after the user chooses users, labels, channels, and model
+    type. The function loads matching captures, extracts feature rows, evaluates
+    or auto-selects the classifier type, refits the final scaler/classifier on
+    all selected data, and writes a ``.joblib`` bundle under ``database/models``.
+    """
     if mode != "single":
         raise ValueError(f"Only 'single' mode is supported. Got: {mode}")
     selected_channel_names, channel_key = normalize_model_channels(selected_channels=selected_channels, channel=channel)
@@ -1414,6 +1446,14 @@ def _tail_window_slice(time_signal, window_seconds):
 
 
 class LivePredictor:
+    """Runtime predictor used by the Testing view.
+
+    ``LivePredictor`` consumes rolling per-channel buffers from the GUI, detects
+    the latest active event slice, extracts the same feature vector used during
+    training, applies the saved scaler/classifier, and smooths the displayed
+    label with confidence gating plus majority voting.
+    """
+
     def __init__(self, bundle, calibration=None, display_threshold=0.70):
         self.bundle = bundle
         self.mode = bundle["mode"]

@@ -31,6 +31,7 @@ Thumbs.db
 desktop.ini
 
 # Project-specific: personal data & generated artifacts
+docs/
 database/users/
 database/calibrations/
 database/models/

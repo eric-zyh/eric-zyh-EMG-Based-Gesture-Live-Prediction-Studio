@@ -29,6 +29,29 @@ EMGesture gives you the full loop: connect an Arduino that streams analog EMG, c
 
 The Arduino sketch should print lines to serial that the GUI can parse (one or two channels supported). `adc` is converted to volts using a 5.0 V reference and 1023-step ADC.
 
+### Arduino serial protocol
+
+The GUI listens at **115200 baud** and accepts one sample per line. Supported
+formats:
+
+```text
+adc0
+adc0 adc1
+t_ms,adc0,voltage0
+t_ms,adc0,voltage0,adc1,voltage1
+```
+
+- `adc0` / `adc1` are raw 10-bit ADC readings from `A0` / `A1`.
+- `t_ms` is device time in milliseconds; the GUI converts it to seconds.
+- If the Arduino sends raw ADC only, the GUI timestamps the sample on the host
+  computer and computes voltage as `adc / 1023 * 5.0`.
+- If the Arduino sends timed comma-separated samples, the voltage fields are
+  used directly.
+
+There is currently no Arduino `.ino` sketch committed in this repository. If a
+sketch is added later, place it under an `arduino/` directory and keep its serial
+output aligned with the formats above.
+
 ---
 
 ## Quick start
