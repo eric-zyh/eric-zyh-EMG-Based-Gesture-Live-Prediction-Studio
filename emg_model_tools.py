@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, classification_report, f1_score
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
 from sklearn.model_selection import GroupShuffleSplit, train_test_split
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neural_network import MLPClassifier
@@ -251,6 +251,24 @@ def model_path_for_name(mode, model_name, channel=DEFAULT_CHANNEL, selected_chan
     return model_dir_for_mode(mode, channel=channel, selected_channels=selected_channels) / f"{sanitize_model_name(model_name)}.joblib"
 
 
+def _model_confusion_heatmap_path(model_path, model_type=None):
+    suffix = "_confusion_matrix"
+    if model_type:
+        suffix = f"_{sanitize_model_type(model_type)}{suffix}"
+    return model_path.with_name(f"{model_path.stem}{suffix}.png")
+
+
+def _clear_model_confusion_heatmaps(model_path):
+    heatmap_paths = [model_path.with_name(f"{model_path.stem}_confusion_matrix.png")]
+    heatmap_paths.extend(model_path.parent.glob(f"{model_path.stem}_*_confusion_matrix.png"))
+    for heatmap_path in heatmap_paths:
+        try:
+            if heatmap_path.exists():
+                heatmap_path.unlink()
+        except OSError:
+            pass
+
+
 def _matching_model_paths(mode, channel=DEFAULT_CHANNEL, selected_channels=None):
     requested_channels, requested_key = normalize_model_channels(selected_channels=selected_channels, channel=channel)
     requested_set = set(requested_channels)
@@ -284,9 +302,9 @@ def list_saved_models(mode, channel=DEFAULT_CHANNEL, selected_channels=None):
 
 
 def delete_named_model(mode, model_name):
-    """Delete all .joblib files matching *model_name* across every channel directory for *mode*.
+    """Delete all model artifacts matching *model_name* across every channel directory for *mode*.
 
-    Returns the number of files deleted.
+    Returns the number of .joblib bundles deleted.
     """
     safe_name = sanitize_model_name(model_name)
     mode_root = MODEL_ROOT / mode
@@ -295,6 +313,7 @@ def delete_named_model(mode, model_name):
         return deleted
     # Search all channel sub-directories and the mode root itself
     for candidate in mode_root.rglob(f"{safe_name}.joblib"):
+        _clear_model_confusion_heatmaps(candidate)
         candidate.unlink()
         deleted += 1
     return deleted
@@ -840,7 +859,121 @@ def _safe_split(X, y, test_size=0.2, groups=None, random_state=42):
     )
 
 
-def _evaluate_split(mode, model_type, X_train, X_test, y_train, y_test):
+def _format_confusion_matrix(labels, matrix, title=None, note=None):
+    label_names = [str(label) for label in labels]
+    matrix = np.asarray(matrix, dtype=int)
+    if matrix.size == 0 or not label_names:
+        return "(confusion matrix unavailable)"
+
+    row_header = "actual/pred"
+    row_width = max(len(row_header), *(len(label) for label in label_names))
+    col_widths = []
+    for col_idx, label in enumerate(label_names):
+        values = [str(int(matrix[row_idx, col_idx])) for row_idx in range(len(label_names))]
+        col_widths.append(max(len(label), *(len(value) for value in values)))
+
+    header = (
+        f"{row_header:<{row_width}}  "
+        + "  ".join(f"{label:>{col_widths[idx]}}" for idx, label in enumerate(label_names))
+    )
+    lines = []
+    if title:
+        lines.append(title)
+    if note:
+        lines.append(note)
+    lines.extend([
+        "rows=actual, columns=predicted",
+        header,
+        "-" * len(header),
+    ])
+    for row_idx, label in enumerate(label_names):
+        values = "  ".join(
+            f"{int(matrix[row_idx, col_idx]):>{col_widths[col_idx]}}"
+            for col_idx in range(len(label_names))
+        )
+        lines.append(f"{label:<{row_width}}  {values}")
+    return "\n".join(lines)
+
+
+def _save_confusion_matrix_heatmap(labels, matrix, output_path, title=None):
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    label_names = [str(label) for label in labels]
+    matrix = np.asarray(matrix, dtype=int)
+    if matrix.size == 0 or not label_names:
+        raise ValueError("Cannot save an empty confusion matrix heatmap.")
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    axis_size = max(4.0, min(12.0, 2.0 + 0.65 * len(label_names)))
+    fig = Figure(figsize=(axis_size, axis_size), dpi=140, constrained_layout=True)
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    image = ax.imshow(matrix, interpolation="nearest", cmap="Blues")
+    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04)
+
+    tick_positions = np.arange(len(label_names))
+    ax.set(
+        xticks=tick_positions,
+        yticks=tick_positions,
+        xticklabels=label_names,
+        yticklabels=label_names,
+        xlabel="Predicted label",
+        ylabel="Actual label",
+        title=title or "Confusion Matrix",
+    )
+    ax.tick_params(axis="x", labelrotation=45)
+    for label in ax.get_xticklabels():
+        label.set_horizontalalignment("right")
+        label.set_rotation_mode("anchor")
+
+    max_value = int(matrix.max()) if matrix.size else 0
+    threshold = max_value / 2.0
+    for row_idx in range(matrix.shape[0]):
+        for col_idx in range(matrix.shape[1]):
+            value = int(matrix[row_idx, col_idx])
+            color = "white" if value > threshold else "black"
+            ax.text(col_idx, row_idx, str(value), ha="center", va="center", color=color)
+
+    fig.savefig(output_path, bbox_inches="tight")
+    return output_path
+
+
+def _save_training_confusion_heatmaps(bundle, model_path):
+    _clear_model_confusion_heatmaps(model_path)
+
+    heatmap_path = _model_confusion_heatmap_path(model_path)
+    _save_confusion_matrix_heatmap(
+        bundle["confusion_labels"],
+        bundle["confusion_matrix"],
+        heatmap_path,
+        title=f"{bundle.get('model_type_display', 'Model')} Confusion Matrix",
+    )
+    bundle["confusion_heatmap_path"] = str(heatmap_path)
+
+    benchmark_heatmap_paths = []
+    for result in bundle.get("benchmark_results") or []:
+        candidate_path = _model_confusion_heatmap_path(model_path, result["model_type"])
+        _save_confusion_matrix_heatmap(
+            result["confusion_labels"],
+            result["confusion_matrix"],
+            candidate_path,
+            title=f"{result.get('model_type_display', result['model_type'])} Confusion Matrix",
+        )
+        result["confusion_heatmap_path"] = str(candidate_path)
+        benchmark_heatmap_paths.append({
+            "model_type": result["model_type"],
+            "model_type_display": result.get("model_type_display", result["model_type"]),
+            "path": str(candidate_path),
+        })
+
+    bundle["benchmark_confusion_heatmap_paths"] = benchmark_heatmap_paths
+    return heatmap_path
+
+
+def _evaluate_split(mode, model_type, X_train, X_test, y_train, y_test, labels=None):
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
@@ -851,17 +984,26 @@ def _evaluate_split(mode, model_type, X_train, X_test, y_train, y_test):
     )
     classifier.fit(X_train_scaled, y_train)
     y_pred = classifier.predict(X_test_scaled)
+    if labels is None:
+        labels = sorted(np.unique(np.concatenate([y_train, y_test])).tolist())
+    matrix = confusion_matrix(y_test, y_pred, labels=labels)
     return {
         "model_type": safe_model_type,
         "model_type_display": display_model_type,
         "accuracy": float(accuracy_score(y_test, y_pred)),
         "macro_f1": float(f1_score(y_test, y_pred, average="macro", zero_division=0)),
-        "report": classification_report(y_test, y_pred, zero_division=0),
+        "report": classification_report(y_test, y_pred, labels=labels, zero_division=0),
+        "confusion_labels": list(labels),
+        "confusion_matrix": matrix.tolist(),
+        "confusion_matrix_text": _format_confusion_matrix(labels, matrix),
+        "_y_true": y_test.tolist(),
+        "_y_pred": y_pred.tolist(),
     }
 
 
 def _benchmark_model_type(mode, model_type, X, y, groups=None, repeats=AUTO_MODEL_SELECTION_SPLITS):
     safe_model_type = sanitize_model_type(model_type)
+    labels = sorted(np.unique(y).tolist())
     split_metrics = []
 
     for split_idx in range(max(1, int(repeats))):
@@ -875,12 +1017,19 @@ def _benchmark_model_type(mode, model_type, X, y, groups=None, repeats=AUTO_MODE
         except ValueError:
             continue
 
-        metrics = _evaluate_split(mode, safe_model_type, X_train, X_test, y_train, y_test)
+        metrics = _evaluate_split(mode, safe_model_type, X_train, X_test, y_train, y_test, labels=labels)
         metrics["split_index"] = split_idx
         split_metrics.append(metrics)
 
     if not split_metrics:
         raise ValueError(f"Unable to evaluate model type: {model_type}")
+
+    aggregate_matrix = np.sum(
+        [np.asarray(item["confusion_matrix"], dtype=int) for item in split_metrics],
+        axis=0,
+    )
+    aggregate_y_true = np.concatenate([np.asarray(item["_y_true"]) for item in split_metrics])
+    aggregate_y_pred = np.concatenate([np.asarray(item["_y_pred"]) for item in split_metrics])
 
     return {
         "model_type": safe_model_type,
@@ -888,7 +1037,15 @@ def _benchmark_model_type(mode, model_type, X, y, groups=None, repeats=AUTO_MODE
         "accuracy_mean": float(np.mean([item["accuracy"] for item in split_metrics])),
         "macro_f1_mean": float(np.mean([item["macro_f1"] for item in split_metrics])),
         "split_count": len(split_metrics),
-        "report": split_metrics[0]["report"],
+        "report": classification_report(aggregate_y_true, aggregate_y_pred, labels=labels, zero_division=0),
+        "confusion_labels": labels,
+        "confusion_matrix": aggregate_matrix.tolist(),
+        "confusion_matrix_text": _format_confusion_matrix(
+            labels,
+            aggregate_matrix,
+            title=f"{model_type_display_name(safe_model_type)} confusion matrix",
+            note="summed across repeated holdout splits",
+        ),
     }
 
 
@@ -906,6 +1063,21 @@ def _format_benchmark_summary(benchmark_results, selected_model_type):
             f"acc={result['accuracy_mean']:.3f}  "
             f"splits={result['split_count']}"
         )
+    return "\n".join(lines)
+
+
+def _format_benchmark_confusion_matrices(benchmark_results):
+    if not benchmark_results:
+        return None
+    lines = [
+        "Per-model confusion matrices",
+        "-" * 40,
+        "Auto Best matrices are summed across repeated holdout splits.",
+    ]
+    for result in benchmark_results:
+        matrix_text = result.get("confusion_matrix_text")
+        if matrix_text:
+            lines.extend(["", matrix_text])
     return "\n".join(lines)
 
 
@@ -1175,8 +1347,10 @@ def export_processed_capture_preview(record, calibration=None, output_dir=None, 
 
 def _train_feature_bundle(mode, X, y, groups, dataset_source, model_type, feature_names, config):
     safe_requested_model_type = sanitize_model_type(model_type)
+    all_labels = sorted(np.unique(y).tolist())
     benchmark_results = None
     benchmark_summary = None
+    benchmark_confusion_matrices = None
 
     if safe_requested_model_type == "auto_best":
         benchmark_results = [
@@ -1196,13 +1370,33 @@ def _train_feature_bundle(mode, X, y, groups, dataset_source, model_type, featur
             benchmark_results,
             selected_result["model_type"],
         )
+        benchmark_confusion_matrices = _format_benchmark_confusion_matrices(benchmark_results)
     else:
         X_train, X_test, y_train, y_test = _safe_split(X, y, groups=groups)
-        selected_result = _evaluate_split(mode, safe_requested_model_type, X_train, X_test, y_train, y_test)
+        selected_result = _evaluate_split(
+            mode,
+            safe_requested_model_type,
+            X_train,
+            X_test,
+            y_train,
+            y_test,
+            labels=all_labels,
+        )
 
     safe_model_type = selected_result["model_type"]
     display_model_type = selected_result["model_type_display"]
     report = selected_result["report"]
+    confusion_note = (
+        "summed across repeated holdout splits"
+        if safe_requested_model_type == "auto_best"
+        else "holdout test split"
+    )
+    confusion_matrix_text = _format_confusion_matrix(
+        selected_result["confusion_labels"],
+        selected_result["confusion_matrix"],
+        title=f"{display_model_type} confusion matrix",
+        note=confusion_note,
+    )
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
@@ -1221,12 +1415,16 @@ def _train_feature_bundle(mode, X, y, groups, dataset_source, model_type, featur
         "dataset_dir": str(dataset_source),
         "sample_count": int(len(X)),
         "report": report,
+        "confusion_labels": list(selected_result["confusion_labels"]),
+        "confusion_matrix": selected_result["confusion_matrix"],
+        "confusion_matrix_text": confusion_matrix_text,
         "model_type": safe_model_type,
         "model_type_display": display_model_type,
         "requested_model_type": safe_requested_model_type,
         "requested_model_type_display": model_type_display_name(safe_requested_model_type),
         "benchmark_results": benchmark_results,
         "benchmark_summary": benchmark_summary,
+        "benchmark_confusion_matrices": benchmark_confusion_matrices,
         "preprocessing_version": CURRENT_PREPROCESSING_VERSION,
         "feature_names": tuple(feature_names),
         "config": dict(config),
@@ -1420,6 +1618,7 @@ def train_named_model(mode, model_name, selected_users=None, selected_labels=Non
     model_dir = model_dir_for_mode(mode, selected_channels=selected_channel_names)
     model_dir.mkdir(parents=True, exist_ok=True)
     model_path = model_path_for_name(mode, safe_model_name, selected_channels=selected_channel_names)
+    _save_training_confusion_heatmaps(bundle, model_path)
     joblib.dump(bundle, model_path)
 
     return {
@@ -1427,6 +1626,93 @@ def train_named_model(mode, model_name, selected_users=None, selected_labels=Non
         "model_name": safe_model_name,
         "model_path": model_path,
     }
+
+
+def continue_training_from_base(mode, base_model_name, new_model_name,
+                                additional_users=None, selected_channels=None,
+                                channel=DEFAULT_CHANNEL, calibration=None):
+    """Train a new feature model from a saved base model plus additional users.
+
+    The feature-based scikit-learn models used here are retrained from the
+    underlying captured CSVs; this keeps SVM/KNN/RandomForest/LogReg behavior
+    consistent even though they do not all support true incremental updates.
+    """
+    safe_base_name = sanitize_model_name(base_model_name)
+    safe_new_name = sanitize_model_name(new_model_name)
+    if safe_new_name == safe_base_name:
+        raise ValueError("Enter a new model name. Continuing training should not overwrite the base model.")
+
+    base_bundle = load_named_model(
+        mode,
+        safe_base_name,
+        channel=channel,
+        selected_channels=selected_channels,
+    )
+    base_users = [
+        sanitize_user_name(user_name)
+        for user_name in (base_bundle.get("selected_users") or [])
+    ]
+    if not base_users:
+        raise ValueError("The base model does not store its training users. Train a fresh model instead.")
+
+    added_users = [
+        sanitize_user_name(user_name)
+        for user_name in (additional_users or [])
+    ]
+    added_users = sorted({user_name for user_name in added_users if user_name})
+    new_users = [user_name for user_name in added_users if user_name not in set(base_users)]
+    if not new_users:
+        raise ValueError("Select at least one user that was not already used by the base model.")
+
+    base_channels = list(base_bundle.get("selected_channels") or [])
+    if not base_channels:
+        base_channels, _channel_key = normalize_model_channels(
+            selected_channels=selected_channels,
+            channel=base_bundle.get("channel", channel),
+        )
+
+    base_labels = list(base_bundle.get("labels") or [])
+    if not base_labels:
+        raise ValueError("The base model does not store its label list. Train a fresh model instead.")
+
+    if len(base_channels) == 1:
+        additional_source = list_data_files(
+            mode,
+            selected_users=new_users,
+            selected_labels=base_labels,
+            selected_channels=base_channels,
+        )
+    else:
+        additional_source = list_capture_groups(
+            mode=mode,
+            selected_users=new_users,
+            selected_labels=base_labels,
+            selected_channels=base_channels,
+        )
+    if not additional_source:
+        raise ValueError(
+            "No matching csv files were found for the additional users with the base model's labels and channels."
+        )
+
+    combined_users = sorted(set(base_users + new_users))
+    result = train_named_model(
+        mode,
+        safe_new_name,
+        selected_users=combined_users,
+        selected_labels=base_labels,
+        selected_channels=base_channels,
+        model_type=base_bundle.get("model_type") or base_bundle.get("requested_model_type") or "random_forest",
+        calibration=calibration,
+    )
+
+    bundle = result["bundle"]
+    bundle["continued_from_model"] = safe_base_name
+    bundle["continued_from_created_at"] = base_bundle.get("created_at")
+    bundle["continued_from_users"] = sorted(set(base_users))
+    bundle["continued_with_users"] = new_users
+    bundle["continued_training_strategy"] = "retrained_from_base_and_additional_user_captures"
+    joblib.dump(bundle, result["model_path"])
+    return result
 
 
 def _majority_vote(history, default_value):

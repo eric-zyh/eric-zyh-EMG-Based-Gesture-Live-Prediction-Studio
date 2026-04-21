@@ -60,6 +60,7 @@ from emg_data_tools import (
 )
 from emg_model_tools import (
     LivePredictor,
+    continue_training_from_base,
     delete_named_model,
     export_processed_capture_preview,
     list_saved_models,
@@ -239,6 +240,8 @@ class EMGCollectorGUI:
         self.home_train_channel_listbox = None
         self.training_mode_var = tk.StringVar(value="single")
         self.training_report_var = tk.StringVar(value="Training results will appear here.")
+        self.ft_new_model_name_var = tk.StringVar()
+        self._last_finetune_base_name = ""
 
         # --- testing page variables ---
         self.model_choice_var = tk.StringVar()
@@ -793,9 +796,8 @@ class EMGCollectorGUI:
         mid = ttk.LabelFrame(form, text="Model Management", padding=12)
         mid.grid(row=0, column=1, sticky="nsew", padx=6)
 
-        ttk.Label(mid, text="Feature-based models train directly from the selected data.\n"
-                  "Conv1D fine-tuning has been removed.\n"
-                  "Use this panel to review and delete saved models.",
+        ttk.Label(mid, text="Continue from a saved base model with the selected users' data.\n"
+                  "A new model is trained and saved separately.",
                   wraplength=220, justify="left", font=("Helvetica", 10)).pack(anchor="w", pady=(0, 12))
 
         ft_form = ttk.Frame(mid)
@@ -806,7 +808,12 @@ class EMGCollectorGUI:
         self.ft_base_var = tk.StringVar()
         self.ft_base_combo = ttk.Combobox(ft_form, textvariable=self.ft_base_var, state="readonly", width=16)
         self.ft_base_combo.grid(row=0, column=1, sticky="we", pady=3)
+        self.ft_base_combo.bind("<<ComboboxSelected>>", lambda e: self._on_finetune_base_changed())
 
+        ttk.Label(ft_form, text="New model").grid(row=1, column=0, sticky="w", pady=3)
+        ttk.Entry(ft_form, textvariable=self.ft_new_model_name_var, width=16).grid(row=1, column=1, sticky="we", pady=3)
+
+        ttk.Button(mid, text="Continue Training", command=self._run_finetune).pack(fill="x", pady=(12, 0))
         ttk.Button(mid, text="Delete Selected Model", command=self._delete_training_model).pack(fill="x", pady=(12, 0))
 
         # ---- RIGHT: Training Report ----
@@ -1595,6 +1602,19 @@ class EMGCollectorGUI:
             type_lines.append(f"Type: {selected_type}")
         type_summary = "\n".join(type_lines)
         benchmark_text = f"{benchmark_summary}\n\n" if benchmark_summary else ""
+        heatmap_lines = []
+        if bundle.get("confusion_heatmap_path"):
+            heatmap_lines.append(f"Confusion heatmap: {bundle['confusion_heatmap_path']}")
+        for item in bundle.get("benchmark_confusion_heatmap_paths") or []:
+            heatmap_lines.append(
+                f"  {item.get('model_type_display', item.get('model_type', '?'))}: {item.get('path')}"
+            )
+        heatmap_text = "\n".join(heatmap_lines)
+        heatmap_block = f"{heatmap_text}\n" if heatmap_text else ""
+        confusion_text = bundle.get("confusion_matrix_text")
+        confusion_block = f"\n\n{confusion_text}" if confusion_text else ""
+        benchmark_confusion_text = bundle.get("benchmark_confusion_matrices")
+        benchmark_confusion_block = f"\n\n{benchmark_confusion_text}" if benchmark_confusion_text else ""
         self._set_training_report(
             f"BASE MODEL TRAINED\n"
             f"{'=' * 40}\n"
@@ -1602,9 +1622,12 @@ class EMGCollectorGUI:
             f"Model: {result['model_name']}\n"
             f"{type_summary}\n"
             f"Samples: {bundle['sample_count']}\n"
-            f"Labels: {', '.join(bundle['labels'])}\n\n"
+            f"Labels: {', '.join(bundle['labels'])}\n"
+            f"{heatmap_block}\n"
             f"{benchmark_text}"
             f"{bundle['report']}"
+            f"{confusion_block}"
+            f"{benchmark_confusion_block}"
         )
         self._refresh_all_training()
         self.ft_base_var.set(result["model_name"])
@@ -1627,12 +1650,83 @@ class EMGCollectorGUI:
         current = self.ft_base_var.get().strip()
         if current not in models:
             self.ft_base_var.set(models[0] if models else "")
+        self._on_finetune_base_changed()
+
+    def _on_finetune_base_changed(self):
+        base_name = self.ft_base_var.get().strip()
+        current_name = self.ft_new_model_name_var.get().strip()
+        previous_default = f"{self._last_finetune_base_name}_continued" if self._last_finetune_base_name else ""
+        if base_name and (not current_name or current_name == previous_default):
+            self.ft_new_model_name_var.set(f"{base_name}_continued")
+        self._last_finetune_base_name = base_name
 
     def _run_finetune(self):
-        messagebox.showinfo(
-            "Unavailable",
-            "Conv1D fine-tuning has been removed. Train a feature-based model directly instead.",
+        mode = self.training_mode_var.get()
+        base_name = self.ft_base_var.get().strip()
+        new_name = self.ft_new_model_name_var.get().strip()
+        if not base_name:
+            messagebox.showerror("Missing base model", "Select a saved base model first.")
+            return
+        if not new_name:
+            messagebox.showerror("Missing name", "Enter a new model name.")
+            return
+        sel_chs = self._get_selected_train_channels() or []
+        sel_users = [
+            self.home_train_user_listbox.get(i)
+            for i in self.home_train_user_listbox.curselection()
+        ] if self.home_train_user_listbox else []
+        if not sel_chs or not sel_users:
+            messagebox.showerror("Missing selection", "Select channels and the users to add.")
+            return
+
+        self._set_training_report("Continuing training in progress...")
+        self.root.update_idletasks()
+        try:
+            result = continue_training_from_base(
+                mode,
+                base_name,
+                new_name,
+                additional_users=sel_users,
+                selected_channels=sel_chs,
+            )
+        except Exception as exc:
+            self._log(f"Continue training failed: {exc}", level="ERROR")
+            self._set_training_report(f"Continue training failed:\n{exc}")
+            messagebox.showerror("Continue training failed", str(exc))
+            return
+
+        bundle = result["bundle"]
+        heatmap_lines = []
+        if bundle.get("confusion_heatmap_path"):
+            heatmap_lines.append(f"Confusion heatmap: {bundle['confusion_heatmap_path']}")
+        heatmap_text = "\n".join(heatmap_lines)
+        heatmap_block = f"{heatmap_text}\n" if heatmap_text else ""
+        confusion_text = bundle.get("confusion_matrix_text")
+        confusion_block = f"\n\n{confusion_text}" if confusion_text else ""
+        self._set_training_report(
+            f"CONTINUED MODEL TRAINED\n"
+            f"{'=' * 40}\n"
+            f"Mode: {mode}\n"
+            f"Base model: {bundle.get('continued_from_model', base_name)}\n"
+            f"New model: {result['model_name']}\n"
+            f"Type: {bundle.get('model_type_display', bundle.get('model_type', '?'))}\n"
+            f"Base users: {', '.join(bundle.get('continued_from_users') or [])}\n"
+            f"Added users: {', '.join(bundle.get('continued_with_users') or [])}\n"
+            f"Samples: {bundle['sample_count']}\n"
+            f"Labels: {', '.join(bundle['labels'])}\n"
+            f"{heatmap_block}\n"
+            f"{bundle['report']}"
+            f"{confusion_block}"
         )
+        self._refresh_all_training()
+        self.ft_base_var.set(result["model_name"])
+        self.ft_new_model_name_var.set(f"{result['model_name']}_continued")
+        self.root.update_idletasks()
+        self._log(
+            f"Continued model trained: base={base_name}, new={result['model_name']}, "
+            f"added_users={bundle.get('continued_with_users')}, samples={bundle['sample_count']}"
+        )
+        messagebox.showinfo("Done", f"Continued model saved: {result['model_name']}")
 
     def _delete_training_model(self):
         """Delete the model currently selected in the saved-model combo."""
@@ -1643,7 +1737,7 @@ class EMGCollectorGUI:
         mode = self.training_mode_var.get()
         if not messagebox.askyesno("Confirm delete",
                                     f"Delete model '{name}' ({mode})?\n\n"
-                                    "This will remove the .joblib file(s) from disk."):
+                                    "This will remove the .joblib and confusion matrix file(s) from disk."):
             return
         deleted = delete_named_model(mode, name)
         self._log(f"Deleted model '{name}' ({mode}): {deleted} file(s) removed.")
@@ -1941,6 +2035,11 @@ class EMGCollectorGUI:
             add(f"Sample count     : {bundle.get('sample_count')}")
             add(f"Dataset source   : {bundle.get('dataset_dir', '?')}")
             add(f"Created at       : {bundle.get('created_at', '?')}")
+            add(f"Confusion heatmap: {bundle.get('confusion_heatmap_path', '(none)')}")
+            if bundle.get("continued_from_model"):
+                add(f"Continued from   : {bundle.get('continued_from_model')}")
+                add(f"Base users       : {bundle.get('continued_from_users')}")
+                add(f"Added users      : {bundle.get('continued_with_users')}")
             feature_names = list(bundle.get("feature_names") or [])
             add(f"Feature count    : {len(feature_names)}")
             if feature_names:
@@ -1951,10 +2050,26 @@ class EMGCollectorGUI:
             report_text = self.predictor.bundle.get("report") or "(no report stored in bundle)"
             add(report_text)
 
+            confusion_text = self.predictor.bundle.get("confusion_matrix_text")
+            if confusion_text:
+                section("Training Confusion Matrix")
+                add(confusion_text)
+
             bench = self.predictor.bundle.get("benchmark_summary")
             if bench:
                 section("Auto Best Benchmark Summary")
                 add(bench)
+
+            benchmark_confusion_text = self.predictor.bundle.get("benchmark_confusion_matrices")
+            if benchmark_confusion_text:
+                section("Auto Best Confusion Matrices")
+                add(benchmark_confusion_text)
+
+            benchmark_heatmap_paths = self.predictor.bundle.get("benchmark_confusion_heatmap_paths")
+            if benchmark_heatmap_paths:
+                section("Auto Best Heatmap Files")
+                for item in benchmark_heatmap_paths:
+                    add(f"  {item.get('model_type_display', item.get('model_type', '?'))}: {item.get('path')}")
 
             bench_results = self.predictor.bundle.get("benchmark_results")
             if bench_results:
